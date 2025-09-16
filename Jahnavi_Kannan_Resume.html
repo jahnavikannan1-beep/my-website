@@ -1,0 +1,820 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Jahnavi Kannan - Resume</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f8f9fa;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+
+        .header .subtitle {
+            font-size: 1.2em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+
+        .header .id {
+            opacity: 0.7;
+            font-size: 0.9em;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .section {
+            margin-bottom: 35px;
+        }
+
+        .section-title {
+            font-size: 1.4em;
+            color: #667eea;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 8px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+
+        .education-item, .experience-item, .position-item {
+            margin-bottom: 25px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+
+        .item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .item-title {
+            font-weight: 600;
+            color: #333;
+            font-size: 1.1em;
+        }
+
+        .item-company {
+            color: #667eea;
+            font-weight: 500;
+            margin-top: 2px;
+        }
+
+        .item-date {
+            color: #666;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+
+        .item-grade {
+            color: #28a745;
+            font-weight: 600;
+            margin-top: 2px;
+        }
+
+        .achievements {
+            list-style: none;
+            margin-top: 15px;
+        }
+
+        .achievements li {
+            margin-bottom: 8px;
+            position: relative;
+            padding-left: 20px;
+        }
+
+        .achievements li:before {
+            content: "▸";
+            color: #667eea;
+            position: absolute;
+            left: 0;
+            font-weight: bold;
+        }
+
+        .subsection {
+            margin: 20px 0 15px 0;
+            font-weight: 600;
+            color: #495057;
+            font-size: 1.05em;
+        }
+
+        .achievement-badge {
+            background: #28a745;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+
+        .duration {
+            background: #6c757d;
+            color: white;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            margin-left: 10px;
+        }
+
+        .interests-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .interest-item {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #28a745;
+        }
+
+        .interest-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .download-btn {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+            transition: all 0.3s ease;
+        }
+
+        .download-btn:hover {
+            background: #5a67d8;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        @media (max-width: 768px) {
+            .item-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            
+            .item-date {
+                margin-top: 5px;
+            }
+            
+            .download-btn {
+                position: static;
+                width: 100%;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+        }
+
+        @media print {
+            body {
+                background: white;
+                padding: 0;
+            }
+            
+            .container {
+                box-shadow: none;
+                border-radius: 0;
+            }
+            
+            .download-btn {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <button class="download-btn" onclick="downloadResume()">📄 Download Resume</button>
+    
+    <div class="container">
+        <header class="header">
+            <h1>Jahnavi Kannan</h1>
+            <div class="subtitle">MBA Candidate • Operations Excellence • Strategic Leadership</div>
+            <div class="id">ID: 10266404 • Class of 2026</div>
+        </header>
+        
+        <div class="content">
+            <section class="section">
+                <h2 class="section-title">Education</h2>
+                <div class="education-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">MBA BITS School of Management (BITSoM), Mumbai</div>
+                            <div class="item-grade">Pursuing</div>
+                        </div>
+                        <div class="item-date">2026</div>
+                    </div>
+                </div>
+                
+                <div class="education-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">B.Com (Hons) - Accounting &amp; Finance</div>
+                            <div class="item-company">Jain University, Bangalore</div>
+                            <div class="item-grade">9/10 CGPA</div>
+                        </div>
+                        <div class="item-date">2021</div>
+                    </div>
+                </div>
+                
+                <div class="education-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Senior School Certificate Examination</div>
+                            <div class="item-company">Delhi Public School South, Bangalore</div>
+                            <div class="item-grade">91.6%</div>
+                        </div>
+                        <div class="item-date">2018</div>
+                    </div>
+                </div>
+                
+                <div class="education-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Secondary School Examination</div>
+                            <div class="item-company">Delhi Public School South, Bangalore</div>
+                            <div class="item-grade">95%</div>
+                        </div>
+                        <div class="item-date">2016</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Academic Achievements</h2>
+                <ul class="achievements">
+                    <li>Gold Medalist and 1st Rank out of 61 students in the Department of Accounting and Finance at Jain University <span class="achievement-badge">2021</span></li>
+                    <li>Recipient of the Annual Scholarship Award (Commerce students), for Academic Achievements by Jain University <span class="achievement-badge">2021</span></li>
+                    <li>Achieved 10/10 CGPA, (1 out of 8 students across India) in the Secondary School Examination conducted by CBSE <span class="achievement-badge">2016</span></li>
+                </ul>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Summer Internship</h2>
+                <div class="experience-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Birla Opus (Institutional Marketing)</div>
+                            <div class="item-company">Aditya Birla Group Leadership Program</div>
+                        </div>
+                        <div class="item-date">Apr'25 - May'25</div>
+                    </div>
+                    
+                    <div class="subsection">SEO &amp; Website Updation</div>
+                    <ul class="achievements">
+                        <li>Implemented SEO tools for 60+ website sections improving Domain Authority from 5 to 11 in ~1.5 months</li>
+                        <li>Curated 40+ Blogs, Listicles &amp; Infographics for Prime website to strengthen Thought Leadership positioning</li>
+                        <li>Executed UAT and facilitated go-live of 9 product pages &amp; interactive Price Calculator on Prime's website</li>
+                    </ul>
+                    
+                    <div class="subsection">Social Media Strategy</div>
+                    <ul class="achievements">
+                        <li>Achieved 13% Instagram and 7% LinkedIn follower growth through tailored, platform-specific content strategies</li>
+                        <li>Designed a 2-month content calendar with 20+ posts across social media handles from ideation to scheduling</li>
+                        <li>Developed 15+ persona-based creative briefs to facilitate targeted B2B influencer marketing campaigns</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Work Experience</h2>
+                <div class="experience-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Operations Associate</div>
+                            <div class="item-company">Morgan Stanley</div>
+                        </div>
+                        <div class="item-date">Jun'21 - May'24 <span class="duration">35 months</span></div>
+                    </div>
+                    
+                    <div class="subsection">Key Achievements</div>
+                    <ul class="achievements">
+                        <li>3 Spotlight Awards among ~60 employees for exemplary stakeholder management &amp; collaboration</li>
+                        <li>Commended for managing a 100% volume spike due to Russia sanctions within 2 months of joining the team</li>
+                        <li>Achieved a 30% volume reduction and 5.5 headcount save by leading a Process Improvement project</li>
+                        <li>Won 1st place out of 10 teams in Operations Automation Expo for enhancing process efficiencies</li>
+                    </ul>
+                    
+                    <div class="subsection">Leadership Initiatives</div>
+                    <ul class="achievements">
+                        <li>Trained 11 new employees &amp; 15 partner company associates for ~390 hours on process and tools</li>
+                        <li>Selected for a 4-team cross-functional project of 15 members to develop a Client Onboarding framework</li>
+                        <li>Directed a comprehensive 7-day onboarding plan for 7 employees, interns &amp; partner company associates</li>
+                    </ul>
+                    
+                    <div class="subsection">Vendor Management &amp; Control</div>
+                    <ul class="achievements">
+                        <li>Monitored that 100% of ~1500 daily volume targets are consistently achieved by Partner Company associates</li>
+                        <li>100% quality screened for newly joined Partner company associates before providing Go-Live approval</li>
+                        <li>Safeguarded the firm against Financial &amp; Reputational risk by comparing client data with Risk lists</li>
+                    </ul>
+                    
+                    <div class="subsection">Quality Improvement</div>
+                    <ul class="achievements">
+                        <li>Decreased inaccurate escalations by 3% through performance supervision of 12 Partner Company associates</li>
+                        <li>Maintained an error margin of ~2% by monitoring the weekly quality of ~70 Partner Company associates</li>
+                        <li>Sustained a monthly quality of ~98% with a 9-member team by regularly training Partner Company associates</li>
+                        <li>Realised a ~15-minute daily time save by leveraging Tableau to automate preparation of End-of-Day emails</li>
+                    </ul>
+                    
+                    <div class="subsection">Stakeholder Management</div>
+                    <ul class="achievements">
+                        <li>Reduced alert processing time by 20% in partnership with a Technology team of 6 using an improved UI</li>
+                        <li>Analysed team capacity to handle a 1.5x monthly volume increase post a $13 billion acquisition of E*Trade</li>
+                        <li>Forecasted 63 man-hour per day savings by integrating ML-based solutions into the screening framework</li>
+                        <li>Interpreted &amp; refined ~35,000 rows of data in monthly volumes, delivering key data trends to stakeholders</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Internship</h2>
+                <div class="experience-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Operations Intern</div>
+                            <div class="item-company">Morgan Stanley</div>
+                        </div>
+                        <div class="item-date">Jun'20 - Jul'20</div>
+                    </div>
+                    
+                    <div class="subsection">Client Onboarding</div>
+                    <ul class="achievements">
+                        <li>Awarded PPO to rejoin the Client Onboarding team in the position of a full-time Operations Analyst</li>
+                        <li>Maintained up-to-date documents for existing &amp; new clients in various internal systems &amp; repositories</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Positions of Responsibility</h2>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">General Secretary</div>
+                            <div class="item-company">Admissions Committee, BITSoM</div>
+                        </div>
+                        <div class="item-date">2024-2026</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>General Secretary of the Admissions, Counselling &amp; Engagement Committee for the year 2025-26</li>
+                        <li>Conducted 150+ profile evaluations and coordinated buddy allocations for 200+ new admits</li>
+                    </ul>
+                </div>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Marketing Club</div>
+                            <div class="item-company">BITSoM</div>
+                        </div>
+                        <div class="item-date">2024</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>Engaged 30+ students through an interactive CX &amp; Customer Journey workshop with Birla Opus</li>
+                        <li>Organized BITSoM's first offline national-level marketing competition with 700+ registrations</li>
+                    </ul>
+                </div>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">USC Marshall x BITSoM</div>
+                        </div>
+                        <div class="item-date">2024</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>Successfully assembled &amp; prepared 160+ gift hampers and ensured timely distribution to all attendees</li>
+                        <li>Successfully managed and oversaw key logistical arrangements for conference attendees</li>
+                    </ul>
+                </div>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Ops Committee</div>
+                            <div class="item-company">Morgan Stanley</div>
+                        </div>
+                        <div class="item-date">2023</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>Spearheaded 5 Employee engagement events with ~100 participants across the department</li>
+                        <li>Hosted ~150 audience in 2 Open Forums and 1 Fire Side chat with Senior Management</li>
+                    </ul>
+                </div>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Head of Public Relations</div>
+                            <div class="item-company">Student Council</div>
+                        </div>
+                        <div class="item-date">2019-21</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>Led an 8-member team for a year, executing all Public Relations tasks for event organisation</li>
+                        <li>Implemented marketing ideas, resulting in ~8000 footfall &amp; ~450 participants for National Fest</li>
+                        <li>Designed &amp; distributed 3 brochures to ~75 colleges across India for the National Level Fest</li>
+                    </ul>
+                </div>
+                
+                <div class="position-item">
+                    <div class="item-header">
+                        <div>
+                            <div class="item-title">Student Mentor</div>
+                            <div class="item-company">MS x Questalliance</div>
+                        </div>
+                        <div class="item-date">2023</div>
+                    </div>
+                    <ul class="achievements">
+                        <li>Conducted 4 extensive one-on-one sessions with class 10 students for career guidance</li>
+                        <li>Served as a role model to ~200 students of class 8th to 10th on a visit to a Government School</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section">
+                <h2 class="section-title">Interests</h2>
+                <div class="interests-grid">
+                    <div class="interest-item">
+                        <div class="interest-title">Carnatic Music</div>
+                        <div>Passed the Junior Carnatic Vocal Exam (2014) in First class, performed in 20+ concerts and shows</div>
+                    </div>
+                    
+                    <div class="interest-item">
+                        <div class="interest-title">Trekking</div>
+                        <div>Completed a high-altitude Himalayan trek (12500 ft) and Youreka Jungle Outback Campouts (2014)</div>
+                    </div>
+                    
+                    <div class="interest-item">
+                        <div class="interest-title">Community Service</div>
+                        <div>Volunteered at the Sarvoham Animal Rescue Foundation in Bangalore with 120+ rescued stray dogs<br><br>
+                        Volunteered to distribute food with FOLK, a youth empowerment club of ISKCON, Bangalore (2019)</div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script>
+        function downloadResume() {
+            // Create a clone of the document
+            const resumeContent = document.documentElement.outerHTML;
+            
+            // Create a blob with the HTML content
+            const blob = new Blob([resumeContent], { type: 'text/html' });
+            
+            // Create a temporary download link
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Jahnavi_Kannan_Resume.html';
+            
+            // Trigger the download
+            document.body.appendChild(a);
+            a.click();
+            
+            // Clean up
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        }
+
+        // Alternative download function for PDF-like print
+        function printResume() {
+            window.print();
+        }
+    </script>
+
+</body></html>
